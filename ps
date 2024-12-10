@@ -1,0 +1,151 @@
+<#
+.SYNOPSIS
+    Retrieves compliance reports for a specific Azure Policy Initiative and stores the report in an Azure Storage Account.
+
+.DESCRIPTION
+    This script connects to Azure using a Managed Identity, retrieves compliance data for a specified Azure Policy Initiative, generates an HTML report, and uploads the report to a designated Azure Storage Blob container.
+
+.PARAMETER PolicyInitiativeName
+    The name of the Azure Policy Initiative for which to retrieve compliance reports.
+
+.PARAMETER SubscriptionId
+    The Azure Subscription ID where the Policy Initiative is assigned.
+
+.PARAMETER StorageAccountName
+    The name of the Azure Storage Account where the report will be stored.
+
+.PARAMETER ContainerName
+    The name of the Blob Container within the Storage Account where the report will be uploaded.
+
+.EXAMPLE
+    ./ComplianceReportRunbook.ps1 -PolicyInitiativeName "MyPolicyInitiative" -SubscriptionId "12345678-1234-1234-1234-123456789abc" -StorageAccountName "mystorageaccount" -ContainerName "compliance-reports"
+#>
+
+param (
+    [Parameter(Mandatory = $true)]
+    [string]$PolicyInitiativeName,  # Name of the Azure Policy Initiative
+
+    [Parameter(Mandatory = $true)]
+    [string]$SubscriptionId,        # Azure Subscription ID
+
+    [Parameter(Mandatory = $true)]
+    [string]$StorageAccountName,    # Name of the Azure Storage Account
+
+    [Parameter(Mandatory = $true)]
+    [string]$ContainerName          # Name of the Blob Container within the Storage Account
+)
+
+try {
+    # Import necessary Azure modules
+    Import-Module Az.Accounts -ErrorAction Stop
+    Import-Module Az.PolicyInsights -ErrorAction Stop
+    Import-Module Az.Storage -ErrorAction Stop
+
+    Write-Output "Modules imported successfully."
+
+    # Authenticate to Azure using Managed Identity
+    Write-Output "Authenticating to Azure using Managed Identity..."
+    Connect-AzAccount -Identity -ErrorAction Stop
+    Write-Output "Authenticated to Azure."
+
+    # Set the context to the specified subscription
+    Write-Output "Setting Azure context to Subscription ID: $SubscriptionId"
+    Set-AzContext -SubscriptionId $SubscriptionId -ErrorAction Stop
+    Write-Output "Azure context set."
+
+    # Retrieve the specified Azure Policy Initiative
+    Write-Output "Retrieving Azure Policy Initiative: $PolicyInitiativeName"
+    $policyInitiative = Get-AzPolicySetDefinition -Name $PolicyInitiativeName -ErrorAction Stop
+
+    if (-not $policyInitiative) {
+        Throw "Policy Initiative '$PolicyInitiativeName' not found in Subscription '$SubscriptionId'."
+    }
+    Write-Output "Policy Initiative retrieved successfully."
+
+    # Get all Policy Assignments associated with the Policy Initiative
+    Write-Output "Retrieving Policy Assignments for the Initiative..."
+    $policyAssignments = Get-AzPolicyAssignment | Where-Object { $_.PolicyDefinitionId -eq $policyInitiative.PolicySetDefinitionId }
+
+    if ($policyAssignments.Count -eq 0) {
+        Write-Warning "No Policy Assignments found for Policy Initiative '$PolicyInitiativeName'."
+    } else {
+        Write-Output "Found $($policyAssignments.Count) Policy Assignments."
+    }
+
+    # Initialize an array to store compliance data
+    $complianceData = @()
+
+    # Iterate through each Policy Assignment to gather compliance states
+    foreach ($assignment in $policyAssignments) {
+        Write-Output "Processing Policy Assignment: $($assignment.Name)"
+        
+        # Retrieve compliance states for the Policy Assignment
+        $complianceStates = Get-AzPolicyState -PolicyAssignmentId $assignment.PolicyAssignmentId -Top 1000
+
+        if ($complianceStates.Count -eq 0) {
+            Write-Warning "No compliance states found for Policy Assignment '$($assignment.Name)'."
+            continue
+        }
+
+        foreach ($state in $complianceStates) {
+            $complianceData += [PSCustomObject]@{
+                PolicyAssignmentName = $assignment.Name
+                PolicyDefinitionName  = $state.PolicyDefinitionName
+                ComplianceState      = $state.ComplianceState
+                Timestamp            = $state.Timestamp
+                ResourceId           = $state.ResourceId
+                ResourceName         = $state.ResourceName
+                ResourceType         = $state.ResourceType
+                SubscriptionId       = $state.SubscriptionId
+            }
+        }
+    }
+
+    # Generate the compliance report
+    if ($complianceData.Count -eq 0) {
+        $complianceReport = "<h2>No compliance data found for Policy Initiative '$PolicyInitiativeName'.</h2>"
+        Write-Warning "No compliance data available to generate report."
+    } else {
+        Write-Output "Generating HTML compliance report..."
+        $complianceReport = $complianceData | 
+            Select-Object PolicyAssignmentName, PolicyDefinitionName, ComplianceState, ResourceName, ResourceType, ResourceId |
+            ConvertTo-Html -Title "Compliance Report for Policy Initiative '$PolicyInitiativeName'" `
+                          -PreContent "<h1>Compliance Report</h1><p>Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>" `
+                          -PostContent "<p>End of Report</p>" |
+            Out-String
+        Write-Output "Compliance report generated successfully."
+    }
+
+    # Convert the report to a byte array
+    $reportBytes = [System.Text.Encoding]::UTF8.GetBytes($complianceReport)
+
+    # Retrieve the Storage Account details
+    Write-Output "Retrieving Storage Account: $StorageAccountName"
+    $storageAccount = Get-AzStorageAccount -Name $StorageAccountName -ErrorAction Stop
+
+    if (-not $storageAccount) {
+        Throw "Storage Account '$StorageAccountName' not found."
+    }
+    Write-Output "Storage Account retrieved successfully."
+
+    # Get the Storage Account context
+    $storageContext = $storageAccount.Context
+
+    # Generate a dynamic file name based on the current date
+    $dateStamp = Get-Date -Format 'yyyyMMdd'
+    $reportFileName = "ComplianceReport_$dateStamp.html"
+
+    # Upload the report to the specified Blob Container
+    Write-Output "Uploading report to Blob Container '$ContainerName'..."
+    Set-AzStorageBlobContent -Container $ContainerName `
+                              -Blob $reportFileName `
+                              -Content $reportBytes `
+                              -Context $storageContext `
+                              -Force -ErrorAction Stop
+    Write-Output "Compliance report '$reportFileName' uploaded successfully to Storage Account '$StorageAccountName' in container '$ContainerName'."
+
+}
+catch {
+    Write-Error "An error occurred: $_"
+    throw $_
+}
