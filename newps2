@@ -1,0 +1,69 @@
+# Simple script to retrieve compliance data for a Policy Initiative and upload an HTML report to a Storage Account.
+
+# Hardcoded variables (no parameters, no error checking)
+$SubscriptionId         = '8af0da49-ad21-45a2-8d69-69fe59010abd'
+$PolicyInitiativeName   = '35ce85589a0644fb856bec36'
+$StorageAccountName     = 'hhigenstgacct'
+$ContainerName          = 'reports'
+
+# Load necessary modules
+Import-Module Az.Accounts
+Import-Module Az.PolicyInsights
+Import-Module Az.Storage
+
+# Authenticate to Azure (Managed Identity)
+Connect-AzAccount -Identity
+
+# Set context to the specified subscription
+Set-AzContext -SubscriptionId $SubscriptionId
+
+# Get the Policy Initiative
+$policyInitiative = Get-AzPolicySetDefinition -Name $PolicyInitiativeName
+
+# Get Policy Assignments tied to that Initiative
+$policyAssignments = Get-AzPolicyAssignment |
+    Where-Object { $_.PolicyDefinitionId -eq $policyInitiative.PolicySetDefinitionId }
+
+# Collect compliance data
+$complianceData = @()
+foreach ($assignment in $policyAssignments) {
+    $complianceStates = Get-AzPolicyState -PolicyAssignmentId $assignment.PolicyAssignmentId -Top 1000
+    foreach ($state in $complianceStates) {
+        $complianceData += [PSCustomObject]@{
+            PolicyAssignmentName = $assignment.Name
+            PolicyDefinitionName = $state.PolicyDefinitionName
+            ComplianceState      = $state.ComplianceState
+            Timestamp            = $state.Timestamp
+            ResourceId           = $state.ResourceId
+            ResourceName         = $state.ResourceName
+            ResourceType         = $state.ResourceType
+            SubscriptionId       = $state.SubscriptionId
+        }
+    }
+}
+
+# Generate HTML report
+$complianceReport = $complianceData |
+    Select-Object PolicyAssignmentName, PolicyDefinitionName, ComplianceState, ResourceName, ResourceType, ResourceId |
+    ConvertTo-Html -Title "Compliance Report for $PolicyInitiativeName" `
+                   -PreContent "<h1>Compliance Report</h1><p>Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>" `
+                   -PostContent "<p>End of Report</p>" |
+    Out-String
+
+# Convert report to bytes
+$reportBytes = [System.Text.Encoding]::UTF8.GetBytes($complianceReport)
+
+# Get the Storage Account context
+$storageAccount = Get-AzStorageAccount -Name $StorageAccountName
+$storageContext = $storageAccount.Context
+
+# Create a filename based on the date
+$dateStamp       = Get-Date -Format 'yyyyMMdd'
+$reportFileName  = "ComplianceReport_$dateStamp.html"
+
+# Upload report
+Set-AzStorageBlobContent -Container $ContainerName `
+                         -Blob $reportFileName `
+                         -Content $reportBytes `
+                         -Context $storageContext `
+                         -Force
