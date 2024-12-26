@@ -1,0 +1,72 @@
+# Minimal script rewritten to use the Azure US Government environment and Managed Identity,
+# without the old commented-out lines.
+
+# Hardcoded variables
+$SubscriptionId       = '8af0da49-ad21-45a2-8d69-69fe59010abd'
+$PolicyInitiativeName = '35ce85589a0644fb856bec36'
+$StorageAccountName   = 'hhigenstgacct'
+$ContainerName        = 'reports'
+
+# Import required modules
+Import-Module Az.Accounts
+Import-Module Az.PolicyInsights
+Import-Module Az.Storage
+
+# Ensure no old contexts are reused
+Disable-AzContextAutosave -Scope Process
+
+# Connect to Azure US Government using system-assigned managed identity
+Connect-AzAccount -EnvironmentName AzureUSGovernment -Identity
+
+# Explicitly set the context to the subscription you want
+Set-AzContext -SubscriptionId $SubscriptionId
+
+# Retrieve the Policy Initiative
+$policyInitiative = Get-AzPolicySetDefinition -Name $PolicyInitiativeName
+
+# Get Policy Assignments associated with that Policy Initiative
+$policyAssignments = Get-AzPolicyAssignment |
+    Where-Object { $_.PolicyDefinitionId -eq $policyInitiative.PolicySetDefinitionId }
+
+# Collect compliance data
+$complianceData = @()
+foreach ($assignment in $policyAssignments) {
+    $complianceStates = Get-AzPolicyState -PolicyAssignmentId $assignment.PolicyAssignmentId -Top 1000
+    foreach ($state in $complianceStates) {
+        $complianceData += [PSCustomObject]@{
+            PolicyAssignmentName = $assignment.Name
+            PolicyDefinitionName = $state.PolicyDefinitionName
+            ComplianceState      = $state.ComplianceState
+            Timestamp            = $state.Timestamp
+            ResourceId           = $state.ResourceId
+            ResourceName         = $state.ResourceName
+            ResourceType         = $state.ResourceType
+            SubscriptionId       = $state.SubscriptionId
+        }
+    }
+}
+
+# Generate HTML report
+$complianceReport = $complianceData |
+    Select-Object PolicyAssignmentName, PolicyDefinitionName, ComplianceState, ResourceName, ResourceType, ResourceId |
+    ConvertTo-Html -Title "Compliance Report for $PolicyInitiativeName" `
+                   -PreContent "<h1>Compliance Report</h1><p>Generated on $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')</p>" `
+                   -PostContent "<p>End of Report</p>" |
+    Out-String
+
+# Convert report to bytes
+$reportBytes = [System.Text.Encoding]::UTF8.GetBytes($complianceReport)
+
+# Retrieve Storage Account and its context
+$storageAccount = Get-AzStorageAccount -Name $StorageAccountName
+$storageContext = $storageAccount.Context
+
+# Generate a filename based on today's date and upload
+$dateStamp      = Get-Date -Format 'yyyyMMdd'
+$reportFileName = "ComplianceReport_$dateStamp.html"
+
+Set-AzStorageBlobContent -Container $ContainerName `
+                         -Blob $reportFileName `
+                         -Content $reportBytes `
+                         -Context $storageContext `
+                         -Force
